@@ -1,4 +1,5 @@
 #include "postgres.h"
+#include "bloom.h"
 #include "access/attnum.h"
 #include "utils/relcache.h"
 #include "access/reloptions.h"
@@ -65,8 +66,8 @@ static relopt_kind    Lsm3ReloptKind;
 /* Lsm3 kooks */
 static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 static shmem_startup_hook_type  PreviousShmemStartupHook = NULL;
-#if PG_VERSION_NUM>=150000
-static shmem_request_hook_type  PreviousShmemRequestHook = NULL;
+#if PG_VERSION_NUM>=140000
+// static shmem_request_hook_type  PreviousShmemRequestHook = NULL;
 #endif
 static ExecutorFinish_hook_type PreviousExecutorFinish = NULL;
 
@@ -76,18 +77,22 @@ static int Lsm3TopIndexSize;
 
 /* Background worker termination flag */
 static volatile bool Lsm3Cancel;
+// /*================INJECTION 3*/
+// /* Global pointer for our demo Bloom Filter */
+// static BloomFilter *active_bloom = NULL;
+// /*================INJECTION 3*/
 
-static void
-lsm3_shmem_request(void)
-{
-#if PG_VERSION_NUM>=150000
-	if (PreviousShmemRequestHook)
-		PreviousShmemRequestHook();
-#endif
+// static void
+// lsm3_shmem_request(void)
+// {
+// #if PG_VERSION_NUM>=140000
+// 	if (PreviousShmemRequestHook)
+// 		PreviousShmemRequestHook();
+// #endif
 
-	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
-	RequestNamedLWLockTranche("lsm3", 1);
-}
+// 	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
+// 	RequestNamedLWLockTranche("lsm3", 1);
+// }
 
 static void
 lsm3_shmem_startup(void)
@@ -525,6 +530,19 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	index = index_open(entry->top[active_index], RowExclusiveLock);
 	index->rd_rel->relam = BTREE_AM_OID;
 	save_am = index->rd_rel->relam;
+
+	// /* ==========================================================
+	//  * INJECTION 1: BLOOM FILTER ADDITION
+	//  * ========================================================== */
+
+	// if (active_bloom == NULL)
+	// {
+	// 	active_bloom = bloom_create(1024 * 1024, 3); /* 1MB Demo Filter */
+	// }
+	// /* Add the inserted value to our Bloom Filter */
+	// bloom_add(active_bloom, &values[0], sizeof(values[0]));
+	// /* ========================================================== */
+
 	btinsert(index, values, isnull, ht_ctid, heapRel, checkUnique,
 #if PG_VERSION_NUM>=140000
 			 indexUnchanged,
@@ -545,6 +563,16 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 		entry->merge_in_progress = true;
 		entry->active_index ^= 1; /* swap top indexes */
 		entry->n_merges += 1;
+		// /* ==========================================================
+		//  * INJECTION 4: BLOOM FILTER RESET
+		//  * We clear the memory here in the frontend process the exact 
+		//  * moment the trees swap, safely avoiding a background segfault.
+		//  * ========================================================== */
+		// if (active_bloom != NULL) {
+		// 	memset(active_bloom->bits, 0, active_bloom->size_in_bytes);
+		// 	elog(LOG, "BLOOM FILTER RESET: Active tree swapped, filter cleared.");
+		// }
+		// /* ========================================================== */
 	}
 	Assert(entry->access_count[active_index] > 0);
 	entry->access_count[active_index] -= 1;
@@ -689,6 +717,49 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 	/* btree indexes are never lossy */
 	scan->xs_recheck = false;
 
+	// /* ==========================================================
+	//  * INJECTION 2: BLOOM FILTER CHECK
+	//  * ========================================================== */
+	// extern BloomFilter *active_bloom;
+	// if (active_bloom != NULL && scan->numberOfKeys > 0)
+	// {
+	// 	Datum search_key = scan->keyData[0].sk_argument;
+
+	// 	if (!bloom_check(active_bloom, &search_key, sizeof(search_key)))
+	// 	{
+	// 		/* Hit! The key is definitely not here. */
+	// 		elog(INFO, "BLOOM FILTER HIT: Bypassing disk scan for this key.");
+	// 		return false;
+	// 	}
+	// }
+	// /* ========================================================== */
+
+
+
+	// /* ==========================================================
+	//  * INJECTION 2: BLOOM FILTER CHECK (ARCHITECTURALLY CORRECT)
+	//  * ========================================================== */
+	// extern BloomFilter *active_bloom;
+	
+	// /* Only check the Bloom filter if the Active tree hasn't already been marked EOF */
+	// if (active_bloom != NULL && scan->numberOfKeys > 0 && !so->eof[so->entry->active_index])
+	// {
+	// 	Datum search_key = scan->keyData[0].sk_argument;
+
+	// 	if (!bloom_check(active_bloom, &search_key, sizeof(search_key)))
+	// 	{
+	// 		/* Hit! The key is definitely not in the ACTIVE tree. */
+	// 		/* Do NOT return false here! Instead, mark only the active tree as exhausted. */
+	// 		so->eof[so->entry->active_index] = true; 
+	// 		elog(INFO, "BLOOM FILTER HIT: Bypassing Active Tree search.");
+	// 	}
+	// }
+	// /* ========================================================== */
+
+
+
+
+
 	if (curr >= 0) /* lazy advance of current index */
 	{
 		so->eof[curr] = !_bt_next(so->scan[curr], dir); /* move forward current index */
@@ -757,6 +828,20 @@ static int64
 lsm3_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*)scan->opaque;
+	// /* ==========================================================
+	//  * INJECTION 3: BLOOM FILTER CHECK FOR BITMAP SCANS
+	//  * ========================================================== */
+	// extern BloomFilter *active_bloom;
+	// if (active_bloom != NULL && scan->numberOfKeys > 0)
+	// {
+	// 	Datum search_key = scan->keyData[0].sk_argument;
+	// 	if (!bloom_check(active_bloom, &search_key, sizeof(search_key)))
+	// 	{
+	// 		elog(INFO, "BLOOM FILTER HIT: Bypassing disk scan for this key (Bitmap Scan).");
+	// 		return 0; /* Instantly return 0 matching rows! */
+	// 	}
+	// }
+	// /* ========================================================== */
 	int64 ntids = 0;
 	for (int i = 0; i < 3; i++)
 	{
@@ -767,6 +852,43 @@ lsm3_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		}
 	}
 	return ntids;
+
+
+
+
+
+	// /* ==========================================================
+	// //  * INJECTION 3: BLOOM FILTER CHECK FOR BITMAP SCANS
+	// //  * ========================================================== */
+	// int64 ntids = 0;
+	// extern BloomFilter *active_bloom;
+	// bool skip_active = false;
+
+	// if (active_bloom != NULL && scan->numberOfKeys > 0)
+	// {
+	// 	Datum search_key = scan->keyData[0].sk_argument;
+	// 	if (!bloom_check(active_bloom, &search_key, sizeof(search_key)))
+	// 	{
+	// 		elog(INFO, "BLOOM FILTER HIT: Bypassing Active Tree (Bitmap Scan).");
+	// 		skip_active = true;
+	// 	}
+	// }
+
+	// for (int i = 0; i < 3; i++)
+	// {
+	// 	if (so->scan[i])
+	// 	{
+	// 		/* If the Bloom filter fired, skip the active index */
+	// 		if (skip_active && i == so->entry->active_index) {
+	// 			continue;
+	// 		}
+			
+	// 		so->scan[i]->xs_snapshot = scan->xs_snapshot;
+	// 		ntids += btgetbitmap(so->scan[i], tbm);
+	// 	}
+	// }
+	// return ntids;
+	// // /* ========================================================== */
 }
 
 Datum
@@ -833,7 +955,7 @@ lsm3_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 	metapage = (Page) palloc(BLCKSZ);
 	_bt_initmetapage(metapage, BTREE_METAPAGE, 0, _bt_allequalimage(index, false));
 
-#if PG_VERSION_NUM>=150000
+#if PG_VERSION_NUM>=140000
 	RelationGetSmgr(index);
 #else
 	RelationOpenSmgr(index);
@@ -935,7 +1057,7 @@ lsm3_btree_wrapper(PG_FUNCTION_ARGS)
 static void
 lsm3_process_utility(PlannedStmt *plannedStmt,
 					 const char *queryString,
-#if PG_VERSION_NUM>=150000
+#if PG_VERSION_NUM>=140000
 					 bool readOnlyTree,
 #endif
 					 ProcessUtilityContext context,
@@ -998,7 +1120,7 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 	(PreviousProcessUtilityHook ? PreviousProcessUtilityHook : standard_ProcessUtility)
 		(plannedStmt,
 		 queryString,
-#if PG_VERSION_NUM>=150000
+#if PG_VERSION_NUM>=140000
 		 readOnlyTree,
 #endif
 		 context,
@@ -1166,12 +1288,9 @@ _PG_init(void)
 	PreviousShmemStartupHook = shmem_startup_hook;
 	shmem_startup_hook = lsm3_shmem_startup;
 
-#if PG_VERSION_NUM>=150000
-	PreviousShmemRequestHook = shmem_request_hook;
-	shmem_request_hook = lsm3_shmem_request;
-#else
-	lsm3_shmem_request();
-#endif
+	// lsm3_shmem_request();
+	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
+	RequestNamedLWLockTranche("lsm3", 1);
 
 	PreviousProcessUtilityHook = ProcessUtility_hook;
     ProcessUtility_hook = lsm3_process_utility;
