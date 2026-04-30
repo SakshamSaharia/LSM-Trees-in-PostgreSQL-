@@ -43,8 +43,8 @@ typedef struct
 
 	uint64 n_merges;  /* Number of performed merges since database open */
 	uint64 n_inserts; /* Number of performed inserts since database open  */
-	volatile bool start_merge; /* Start merging of top index with base index */
-	volatile bool merge_in_progress; /* Overflow of top index intiate merge process */
+	volatile bool start_merge; /* LSM3 MULTI-LEVEL COMPACTION CHANGE: start top -> level0 -> cascade compaction */
+	volatile bool merge_in_progress; /* Overflow/manual request initiated a multi-level compaction */
 	PGPROC* merger;   /* Merger background worker */
 	Oid     db_id;    /* user ID (for background worker) */
 	Oid     user_id;  /* database Id (for background worker) */
@@ -67,7 +67,7 @@ typedef struct
 	 */
 	Relation 	   component_index[LSM3_MAX_COMPONENTS]; /* Opened auxiliary index relations; base uses scan relation itself */
 	SortSupport    sortKeys;   /* Context for comparing index tuples */
-	IndexScanDesc  scan[LSM3_MAX_COMPONENTS];    /* Scan descrip level_size_ratio is for later compaction thresholdtors for all active components */
+	IndexScanDesc  scan[LSM3_MAX_COMPONENTS];    /* Scan descriptors for all active components */
 	bool           eof[LSM3_MAX_COMPONENTS];     /* Indicators that end of index was reached */
 	int            ncomponents; /* Number of active scan components: two tops + active levels + base */
 
@@ -86,7 +86,7 @@ typedef struct
 	 * These reloptions make the number of levels configurable while preserving fixed shared-memory capacity.
 	 */
 	int         num_levels;
-	int         level_size_ratio;
+	int         level_size_ratio; /* LSM3 MULTI-LEVEL COMPACTION CHANGE: controls level size thresholds during cascading compaction */
 
 	bool        unique;			/* Index may not contain duplicates. We prohibit unique constraint for Lsm3 index
                                  * because it can not be enforced. But presence of this index option allows to optimize

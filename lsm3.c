@@ -50,7 +50,11 @@ PG_FUNCTION_INFO_V1(lsm3_top_index_size);
 extern void	_PG_init(void);
 extern void	_PG_fini(void);
 
-PGDLLEXPORT  extern void lsm3_merger_main(Datum arg);
+/*
+ * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+ * Export the background worker entry point because RegisterDynamicBackgroundWorker() resolves it by name.
+ */
+extern PGDLLEXPORT void lsm3_merger_main(Datum arg);
 
 /* Lsm3 dictionary (hashtable with control data for all indexes) */
 static HTAB*          Lsm3Dict;
@@ -318,21 +322,27 @@ lsm3_truncate_index(Oid index_oid, Oid heap_oid)
 #define INSERT_FLAGS false
 #endif
 
-/* Merge top index into base index */
+/*
+ * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+ * Merge any source component into any destination component.
+ * The old code only used this as "top index -> base index"; cascading compaction now also uses it for level[i] -> level[i+1].
+ */
 static void
 lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
 {
-	Relation top_index = index_open(src_oid, AccessShareLock);
+	Relation src_index = index_open(src_oid, AccessShareLock);
 	Relation heap = table_open(heap_oid, AccessShareLock);
-	Relation base_index = index_open(dst_oid, RowExclusiveLock);
+	Relation dst_index = index_open(dst_oid, RowExclusiveLock);
 	IndexScanDesc scan;
 	bool ok;
-	Oid  save_am = base_index->rd_rel->relam;
+	Oid  save_am = dst_index->rd_rel->relam;
 
-	elog(LOG, "Lsm3: merge top index %s with size %d blocks", RelationGetRelationName(top_index), RelationGetNumberOfBlocks(top_index));
+	elog(LOG, "Lsm3: merge component %s (%d blocks) into %s (%d blocks)",
+		 RelationGetRelationName(src_index), RelationGetNumberOfBlocks(src_index),
+		 RelationGetRelationName(dst_index), RelationGetNumberOfBlocks(dst_index));
 
-	base_index->rd_rel->relam = BTREE_AM_OID;
-	scan = index_beginscan(heap, top_index, SnapshotAny, 0, 0);
+	dst_index->rd_rel->relam = BTREE_AM_OID;
+	scan = index_beginscan(heap, src_index, SnapshotAny, 0, 0);
 	scan->xs_want_itup = true;
 	btrescan(scan, NULL, 0, 0, 0);
 	for (ok = _bt_first(scan, ForwardScanDirection); ok; ok = _bt_next(scan, ForwardScanDirection))
@@ -352,22 +362,98 @@ lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
 			unsigned short save_info = itup->t_info;
 			itup->t_info = (save_info & ~(INDEX_SIZE_MASK | INDEX_ALT_TID_MASK)) + BTreeTupleGetPostingOffset(itup);
 			itup->t_tid = scan->xs_heaptid;
-			_bt_doinsert(base_index, itup, INSERT_FLAGS, heap); /* lsm3 index is not unique so need not to heck for duplica
-tes */
+			_bt_doinsert(dst_index, itup, INSERT_FLAGS, heap); /* lsm3 index is not unique so need not to check duplicates */
 			itup->t_tid = save_tid;
 			itup->t_info = save_info;
 		}
 		else
 		{
-			_bt_doinsert(base_index, itup, INSERT_FLAGS, heap); /* lsm3 index is not unique so need not to heck for duplica
-tes */
+			_bt_doinsert(dst_index, itup, INSERT_FLAGS, heap); /* lsm3 index is not unique so need not to check duplicates */
 		}
 	}
 	index_endscan(scan);
-	base_index->rd_rel->relam = save_am;
-	index_close(top_index, AccessShareLock);
-	index_close(base_index, RowExclusiveLock);
+	dst_index->rd_rel->relam = save_am;
+	index_close(src_index, AccessShareLock);
+	index_close(dst_index, RowExclusiveLock);
 	table_close(heap, AccessShareLock);
+}
+
+/*
+ * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+ * Compute the size limit for level[level_no] in KB.
+ * Formula: level0 = top_size * ratio, level1 = top_size * ratio^2, ...
+ */
+static int64
+lsm3_level_threshold_kb(Lsm3DictEntry* entry, int level_no)
+{
+	int64 threshold = entry->top_index_size ? entry->top_index_size : Lsm3TopIndexSize;
+
+	for (int i = 0; i <= level_no; i++)
+	{
+		if (threshold > PG_INT64_MAX / entry->level_size_ratio)
+			return PG_INT64_MAX;
+		threshold *= entry->level_size_ratio;
+	}
+	return threshold;
+}
+
+/*
+ * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+ * Return true when an index relation is larger than its configured compaction threshold.
+ * Sizes are compared in KB to match the existing top_index_size option.
+ */
+static bool
+lsm3_index_exceeds_threshold(Oid index_oid, int64 threshold_kb)
+{
+	BlockNumber blocks = lsm3_get_index_size(index_oid);
+	int64 size_kb = (int64)blocks * (BLCKSZ / 1024);
+
+	return size_kb > threshold_kb;
+}
+
+/*
+ * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+ * Compact the inactive top index into level0, then cascade oversized levels upward.
+ * The final configured level is compacted into the base index.
+ */
+static void
+lsm3_compact_from_top(Lsm3DictEntry* entry, int top_index)
+{
+	/* First stage: old L0/top component is no longer merged directly into base; it goes to level0. */
+	pgstat_report_activity(STATE_RUNNING, "merging top into level0");
+	elog(LOG, "Lsm3: compact top%d into level0", top_index);
+	lsm3_merge_indexes(entry->level[0], entry->top[top_index], entry->heap);
+
+	pgstat_report_activity(STATE_RUNNING, "truncate compacted top");
+	lsm3_truncate_index(entry->top[top_index], entry->heap);
+
+	/* Cascading stage: if a level crosses its threshold, push it to the next level or base. */
+	for (int level_no = 0; level_no < entry->num_levels; level_no++)
+	{
+		Oid src_oid = entry->level[level_no];
+		Oid dst_oid = (level_no + 1 < entry->num_levels) ? entry->level[level_no + 1] : entry->base;
+		int64 threshold_kb = lsm3_level_threshold_kb(entry, level_no);
+
+		if (!OidIsValid(src_oid) || !OidIsValid(dst_oid))
+			continue;
+
+		if (!lsm3_index_exceeds_threshold(src_oid, threshold_kb))
+		{
+			elog(DEBUG1, "Lsm3: level%d remains below threshold " INT64_FORMAT " KB", level_no, threshold_kb);
+			continue;
+		}
+
+		pgstat_report_activity(STATE_RUNNING, "cascading level compaction");
+		elog(LOG, "Lsm3: compact level%d into %s because it exceeded " INT64_FORMAT " KB",
+			 level_no,
+			 (level_no + 1 < entry->num_levels) ? "next level" : "base",
+			 threshold_kb);
+
+		lsm3_merge_indexes(dst_oid, src_oid, entry->heap);
+
+		pgstat_report_activity(STATE_RUNNING, "truncate compacted level");
+		lsm3_truncate_index(src_oid, entry->heap);
+	}
 }
 
 /* Lsm3 index options.
@@ -435,25 +521,26 @@ lsm3_merger_main(Datum arg)
 		SpinLockAcquire(&entry->spinlock);
 		if (entry->start_merge)
 		{
-			merge_index = 1 - entry->active_index; /* at this moment active index should already by swapped */
+			merge_index = 1 - entry->active_index; /* at this moment active index should already be swapped */
 			entry->start_merge = false;
 		}
 		SpinLockRelease(&entry->spinlock);
 
 		if (merge_index >= 0)
 		{
+			/*
+			 * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+			 * The worker now performs top -> level0 followed by level cascading.
+			 * The old implementation did only top -> base.
+			 */
 			StartTransactionCommand();
 			{
-				pgstat_report_activity(STATE_RUNNING, "merging");
-				lsm3_merge_indexes(entry->base, entry->top[merge_index], entry->heap);
-
-				pgstat_report_activity(STATE_RUNNING, "truncate");
-				lsm3_truncate_index(entry->top[merge_index], entry->heap);
+				lsm3_compact_from_top(entry, merge_index);
 			}
 			CommitTransactionCommand();
 
 			SpinLockAcquire(&entry->spinlock);
-			entry->merge_in_progress = false; /* mark merge as completed */
+			entry->merge_in_progress = false; /* mark multi-level compaction as completed */
 			SpinLockRelease(&entry->spinlock);
 		}
 	}
@@ -567,7 +654,10 @@ lsm3_reacquire_locks(void)
 	}
 }
 
-/* Insert in active top index, on overflow swap active indexes and initiate merge to base index */
+/*
+ * Insert in active top index; on overflow swap active indexes and initiate multi-level compaction.
+ * LSM3 MULTI-LEVEL COMPACTION CHANGE: the merge target is now level0 first, not base directly.
+ */
 static bool
 lsm3_insert(Relation rel, Datum *values, bool *isnull,
 			ItemPointer ht_ctid, Relation heapRel,
@@ -641,7 +731,7 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 		&& top_blocks*(BLCKSZ/1024) > top_index_size;
 
 	SpinLockAcquire(&entry->spinlock);
-	/* If merge was not initiated before by somebody else, then do it */
+	/* If multi-level compaction was not initiated before by somebody else, then schedule it */
 	if (overflow && !entry->merge_in_progress && entry->n_merges == n_merges)
 	{
 		Assert(entry->active_index == active_index);
@@ -1459,6 +1549,10 @@ lsm3_get_merge_count(PG_FUNCTION_ARGS)
 Datum
 lsm3_start_merge(PG_FUNCTION_ARGS)
 {
+	/*
+	 * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+	 * Manual merge now triggers the same top -> level0 -> cascade path as automatic overflow.
+	 */
 	Oid	relid = PG_GETARG_OID(0);
 	Relation index = index_open(relid, AccessShareLock);
 	Lsm3DictEntry* entry = lsm3_get_entry(index);
