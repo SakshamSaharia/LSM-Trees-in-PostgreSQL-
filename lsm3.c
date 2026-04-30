@@ -35,6 +35,7 @@
 #include "storage/procarray.h"
 
 #include "lsm3.h"
+#include "bloom.h" /* bloom injection: separate Bloom helper module. */
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -81,11 +82,7 @@ static int Lsm3TopIndexSize;
 /* Background worker termination flag */
 static volatile bool Lsm3Cancel;
 
-/*
- * LSM3 MULTI-RUN LEVEL CHANGE:
- * Bloom-filter checkpoint code was removed from this file so the multi-level layout can be implemented first.
- * Bloom filters should later be reintroduced per component instead of as one global active-tree filter.
- */
+/* bloom injection: Bloom implementation has been moved to bloom.c/bloom.h. */
 
 static void
 lsm3_shmem_request(void)
@@ -148,6 +145,9 @@ lsm3_init_entry(Lsm3DictEntry* entry, Relation index)
 		for (int run_no = 0; run_no < LSM3_MAX_RUNS_PER_LEVEL; run_no++)
 		{
 			entry->level[level_no][run_no] = InvalidOid;
+
+			/* bloom injection: initialize per-run generation counters used to invalidate backend-local filters. */
+			entry->level_bloom_generation[level_no][run_no] = 0;
 		}
 	}
 
@@ -228,6 +228,61 @@ lsm3_component_oid(Lsm3DictEntry* entry, int component)
 	Assert(run_no >= 0 && run_no < entry->runs_per_level);
 
 	return entry->level[level_no][run_no];
+}
+
+/* bloom injection: map a logical component slot back to its level/run coordinates. */
+static bool
+lsm3_component_level_run(Lsm3DictEntry* entry, int component, int *level_no, int *run_no)
+{
+	int level_slot;
+
+	if (component < LSM3_NUM_TOP_INDEXES || component == lsm3_base_component(entry))
+		return false;
+
+	level_slot = component - LSM3_NUM_TOP_INDEXES;
+	*level_no = level_slot / entry->runs_per_level;
+	*run_no = level_slot % entry->runs_per_level;
+
+	return *level_no >= 0 && *level_no < entry->num_levels &&
+		   *run_no >= 0 && *run_no < entry->runs_per_level;
+}
+
+/* bloom injection: use Bloom only for immutable occupied level runs, never for tops/base/unoccupied slots. */
+static bool
+lsm3_bloom_component_eligible(Lsm3ScanOpaque *so, int component, int *level_no, int *run_no)
+{
+	if (!so->bloom_enabled)
+		return false;
+
+	if (!lsm3_component_level_run(so->entry, component, level_no, run_no))
+		return false;
+
+	if (*run_no >= so->entry->level_run_count[*level_no])
+		return false;
+
+	return so->component_index[component] != NULL;
+}
+
+/*
+ * bloom injection:
+ * lsm3.c decides whether a component is eligible; bloom.c owns the actual
+ * backend-local Bloom cache, build, hash, and membership-check code.
+ */
+static bool
+lsm3_bloom_might_contain_component(Lsm3ScanOpaque *so, int component, Datum key)
+{
+	int level_no;
+	int run_no;
+	uint64 generation;
+
+	if (!lsm3_bloom_component_eligible(so, component, &level_no, &run_no))
+		return true;
+
+	generation = so->entry->level_bloom_generation[level_no][run_no];
+	return lsm3_bloom_might_contain_relation(so->component_index[component],
+										  so->entry->heap,
+										  generation,
+										  key);
 }
 
 /*
@@ -516,6 +571,9 @@ lsm3_add_component_to_level(Lsm3DictEntry* entry, int level_no, Oid src_oid, con
 	pgstat_report_activity(STATE_RUNNING, "truncate source component");
 	lsm3_truncate_index(src_oid, entry->heap);
 
+	/* bloom injection: destination run content changed, so invalidate cached Bloom filters. */
+	entry->level_bloom_generation[level_no][dst_run] += 1;
+
 	entry->level_run_count[level_no] += 1;
 
 	if (lsm3_level_should_compact(entry, level_no))
@@ -580,12 +638,18 @@ lsm3_compact_level(Lsm3DictEntry* entry, int level_no)
 
 		lsm3_merge_indexes(dst_oid, src_oid, entry->heap);
 		lsm3_truncate_index(src_oid, entry->heap);
+
+		/* bloom injection: source run was truncated, so invalidate cached Bloom filters. */
+		entry->level_bloom_generation[level_no][run_no] += 1;
 	}
 
 	entry->level_run_count[level_no] = 0;
 
 	if (level_no + 1 < entry->num_levels)
 	{
+		/* bloom injection: destination run content changed, so invalidate cached Bloom filters. */
+		entry->level_bloom_generation[level_no + 1][dst_run] += 1;
+
 		entry->level_run_count[level_no + 1] += 1;
 		if (lsm3_level_should_compact(entry, level_no + 1))
 			lsm3_compact_level(entry, level_no + 1);
@@ -626,6 +690,9 @@ lsm3_options(Datum reloptions, bool validate)
 		{"num_levels", RELOPT_TYPE_INT, offsetof(Lsm3Options, num_levels)},
 		{"runs_per_level", RELOPT_TYPE_INT, offsetof(Lsm3Options, runs_per_level)},
 		{"level_size_ratio", RELOPT_TYPE_INT, offsetof(Lsm3Options, level_size_ratio)},
+
+		/* bloom injection: parse reloption controlling equality-lookup Bloom skipping. */
+		{"bloom_enabled", RELOPT_TYPE_BOOL, offsetof(Lsm3Options, bloom_enabled)},
 
 		{"unique", RELOPT_TYPE_BOOL, offsetof(Lsm3Options, unique)}
 	};
@@ -997,6 +1064,10 @@ lsm3_beginscan(Relation rel, int nkeys, int norderbys)
 	}
 
 	so->unique = rel->rd_options ? ((Lsm3Options*)rel->rd_options)->unique : false;
+
+	/* bloom injection: cache reloption value for the scan. */
+	so->bloom_enabled = rel->rd_options ? ((Lsm3Options*)rel->rd_options)->bloom_enabled : true;
+
 	so->curr_index = -1;
 	scan->opaque = so;
 
@@ -1008,6 +1079,19 @@ lsm3_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 			ScanKey orderbys, int norderbys)
 {
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*) scan->opaque;
+
+	/*
+	 * bloom injection:
+	 * PostgreSQL passes the real scan keys to amrescan(), not ambeginscan().
+	 * We forward those keys to every internal B-tree scan below, but Bloom key
+	 * extraction reads the outer LSM scan descriptor in lsm3_gettuple()/getbitmap().
+	 * Therefore we must also copy the latest scan keys into the outer descriptor.
+	 */
+	if (scankey && nscankeys > 0)
+	{
+		Assert(scan->numberOfKeys >= nscankeys);
+		memcpy(scan->keyData, scankey, nscankeys * sizeof(ScanKeyData));
+	}
 
 	/*
 	 * LSM3 MULTI-RUN LEVEL CHANGE:
@@ -1057,6 +1141,10 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 	int try_index_order[LSM3_MAX_COMPONENTS];
 	int order_count = 0;
 
+	/* bloom injection: Bloom filters are useful only for equality predicates on first index key. */
+	Datum bloom_key = (Datum) 0;
+	bool bloom_key_valid = lsm3_bloom_extract_equality_key(scan, &bloom_key);
+
 	/* btree indexes are never lossy */
 	scan->xs_recheck = false;
 
@@ -1101,6 +1189,13 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 		so->scan[i]->xs_snapshot = scan->xs_snapshot;
 		if (!so->eof[i] && !BTScanPosIsValid(bto->currPos))
 		{
+			/* bloom injection: skip immutable level-run component if Bloom proves key absence. */
+			if (bloom_key_valid && !lsm3_bloom_might_contain_component(so, i, bloom_key))
+			{
+				so->eof[i] = true;
+				continue;
+			}
+
 			so->eof[i] = !_bt_first(so->scan[i], dir);
 			if (!so->eof[i] && so->unique && scan->numberOfKeys == scan->indexRelation->rd_index->indnkeyatts)
 			{
@@ -1165,13 +1260,21 @@ lsm3_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	/*
 	 * LSM3 MULTI-RUN LEVEL CHANGE:
 	 * Bitmap scan now visits every active component instead of two top indexes plus base only.
-	 * Bloom-filter skip logic is intentionally removed in this first multi-level patch.
+	 * bloom injection: equality bitmap scans can skip immutable level runs using complete Bloom filters.
 	 */
+	Datum bloom_key = (Datum) 0;
+	bool bloom_key_valid = lsm3_bloom_extract_equality_key(scan, &bloom_key);
+
 	for (int i = 0; i < so->ncomponents; i++)
 	{
 		if (so->scan[i])
 		{
 			so->scan[i]->xs_snapshot = scan->xs_snapshot;
+
+			/* bloom injection: skip this component only if absence is guaranteed. */
+			if (bloom_key_valid && !lsm3_bloom_might_contain_component(so, i, bloom_key))
+				continue;
+
 			ntids += btgetbitmap(so->scan[i], tbm);
 		}
 	}
@@ -1687,6 +1790,11 @@ _PG_init(void)
 	add_int_reloption(Lsm3ReloptKind, "level_size_ratio",
 					  "Size multiplier between LSM levels",
 					  LSM3_DEFAULT_LEVEL_SIZE_RATIO, 2, INT_MAX, AccessExclusiveLock);
+
+	/* bloom injection: opt-in/out switch for backend-local per-component Bloom filters. */
+	add_bool_reloption(Lsm3ReloptKind, "bloom_enabled",
+					   "Use per-component Bloom filters for equality lookups on immutable level runs",
+					   true, AccessExclusiveLock);
 
 	add_int_reloption(Lsm3ReloptKind, "fillfactor",
 					  "Packs btree index pages only to this percentage",

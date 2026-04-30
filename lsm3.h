@@ -19,6 +19,12 @@
 #define LSM3_MAX_COMPONENTS (LSM3_NUM_TOP_INDEXES + (LSM3_MAX_LEVELS * LSM3_MAX_RUNS_PER_LEVEL) + 1)
 
 /*
+ * bloom injection:
+ * Backend-local Bloom filters are keyed by physical component OID and invalidated using
+ * shared generation counters whenever level-run components are rewritten/truncated.
+ */
+
+/*
  * Control structure for Lsm3 index located in shared memory
  */
 typedef struct
@@ -46,6 +52,13 @@ typedef struct
 	int runs_per_level;
 	int level_run_count[LSM3_MAX_LEVELS];
 	int level_size_ratio;
+
+	/*
+	 * bloom injection:
+	 * Generation is bumped whenever a level run is rewritten/truncated so backend-local
+	 * Bloom cache entries can detect stale filters even if the relation size stays one page.
+	 */
+	uint64 level_bloom_generation[LSM3_MAX_LEVELS][LSM3_MAX_RUNS_PER_LEVEL];
 
 	uint64 n_merges;  /* Number of performed top-level merge requests since database open */
 	uint64 n_inserts; /* Number of performed inserts since database open  */
@@ -78,6 +91,14 @@ typedef struct
 	int            ncomponents; /* Number of active scan components: two tops + active level runs + base */
 
 	bool           unique;     /* Whether index is "unique" and we can stop scan after locating first occurrence */
+
+	/*
+	 * bloom injection:
+	 * Cached from reloptions at scan start. Bloom filters are used only for equality probes
+	 * on immutable occupied level runs, never for active tops or range scans.
+	 */
+	bool           bloom_enabled;
+
 	int            curr_index; /* Index from which last tuple was selected (or -1 if none) */
 } Lsm3ScanOpaque;
 
@@ -94,6 +115,12 @@ typedef struct
 	int         num_levels;
 	int         runs_per_level;
 	int         level_size_ratio;
+
+	/*
+	 * bloom injection:
+	 * Enables/disables backend-local per-component Bloom filters for equality point lookups.
+	 */
+	bool        bloom_enabled;
 
 	bool        unique;			/* Index may not contain duplicates. We prohibit unique constraint for Lsm3 index
                                  * because it can not be enforced. But presence of this index option allows to optimize
