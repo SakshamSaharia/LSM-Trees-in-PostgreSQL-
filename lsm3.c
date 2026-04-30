@@ -1,5 +1,4 @@
 #include "postgres.h"
-#include "bloom.h"
 #include "access/attnum.h"
 #include "utils/relcache.h"
 #include "access/reloptions.h"
@@ -51,7 +50,7 @@ PG_FUNCTION_INFO_V1(lsm3_top_index_size);
 extern void	_PG_init(void);
 extern void	_PG_fini(void);
 
-extern void lsm3_merger_main(Datum arg);
+PGDLLEXPORT  extern void lsm3_merger_main(Datum arg);
 
 /* Lsm3 dictionary (hashtable with control data for all indexes) */
 static HTAB*          Lsm3Dict;
@@ -67,7 +66,7 @@ static relopt_kind    Lsm3ReloptKind;
 static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 static shmem_startup_hook_type  PreviousShmemStartupHook = NULL;
 #if PG_VERSION_NUM>=140000
-// static shmem_request_hook_type  PreviousShmemRequestHook = NULL;
+static shmem_request_hook_type  PreviousShmemRequestHook = NULL;
 #endif
 static ExecutorFinish_hook_type PreviousExecutorFinish = NULL;
 
@@ -77,22 +76,24 @@ static int Lsm3TopIndexSize;
 
 /* Background worker termination flag */
 static volatile bool Lsm3Cancel;
-// /*================INJECTION 3*/
-// /* Global pointer for our demo Bloom Filter */
-// static BloomFilter *active_bloom = NULL;
-// /*================INJECTION 3*/
 
-// static void
-// lsm3_shmem_request(void)
-// {
-// #if PG_VERSION_NUM>=140000
-// 	if (PreviousShmemRequestHook)
-// 		PreviousShmemRequestHook();
-// #endif
+/*
+ * LSM3 MULTI-LEVEL CHANGE:
+ * Bloom-filter checkpoint code was removed from this file so the multi-level layout can be implemented first.
+ * Bloom filters should later be reintroduced per component instead of as one global active-tree filter.
+ */
 
-// 	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
-// 	RequestNamedLWLockTranche("lsm3", 1);
-// }
+static void
+lsm3_shmem_request(void)
+{
+#if PG_VERSION_NUM>=140000
+	if (PreviousShmemRequestHook)
+		PreviousShmemRequestHook();
+#endif
+
+	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
+	RequestNamedLWLockTranche("lsm3", 1);
+}
 
 static void
 lsm3_shmem_startup(void)
@@ -117,6 +118,12 @@ lsm3_shmem_startup(void)
 static void
 lsm3_init_entry(Lsm3DictEntry* entry, Relation index)
 {
+	/*
+	 * LSM3 MULTI-LEVEL CHANGE:
+	 * Initialize fixed-capacity metadata for configurable levels; only entry->num_levels slots are used at runtime.
+	 */
+	Lsm3Options* opts = index->rd_options ? (Lsm3Options*)index->rd_options : NULL;
+
 	SpinLockInit(&entry->spinlock);
 	entry->active_index = 0;
 	entry->merger = NULL;
@@ -124,12 +131,32 @@ lsm3_init_entry(Lsm3DictEntry* entry, Relation index)
 	entry->start_merge = false;
 	entry->n_merges = 0;
 	entry->n_inserts = 0;
-	entry->top[0] = entry->top[1] = InvalidOid;
-	entry->access_count[0] = entry->access_count[1] = 0;
+
+	for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
+	{
+		entry->top[i] = InvalidOid;
+		entry->access_count[i] = 0;
+	}
+
+	for (int i = 0; i < LSM3_MAX_LEVELS; i++)
+	{
+		entry->level[i] = InvalidOid;
+	}
+
+	entry->num_levels = opts ? opts->num_levels : LSM3_DEFAULT_LEVELS;
+	if (entry->num_levels < 1)
+		entry->num_levels = 1;
+	if (entry->num_levels > LSM3_MAX_LEVELS)
+		entry->num_levels = LSM3_MAX_LEVELS;
+
+	entry->level_size_ratio = opts ? opts->level_size_ratio : LSM3_DEFAULT_LEVEL_SIZE_RATIO;
+	if (entry->level_size_ratio < 2)
+		entry->level_size_ratio = LSM3_DEFAULT_LEVEL_SIZE_RATIO;
+
 	entry->heap = index->rd_index->indrelid;
 	entry->db_id = MyDatabaseId;
 	entry->user_id = GetUserId();
-	entry->top_index_size = index->rd_options ? ((Lsm3Options*)index->rd_options)->top_index_size : 0;
+	entry->top_index_size = opts ? opts->top_index_size : 0;
 }
 
 /* Get B-Tree index size (number of blocks) */
@@ -140,6 +167,37 @@ lsm3_get_index_size(Oid relid)
        BlockNumber size = RelationGetNumberOfBlocks(index);
 	   index_close(index, AccessShareLock);
        return size;
+}
+
+
+/*
+ * LSM3 MULTI-LEVEL CHANGE:
+ * Component helpers map logical scan/compaction component numbers to physical index OIDs.
+ * Layout: 0=top0, 1=top1, 2..(2+num_levels-1)=levels, last=base.
+ */
+static inline int
+lsm3_num_components(Lsm3DictEntry* entry)
+{
+	return LSM3_NUM_TOP_INDEXES + entry->num_levels + 1;
+}
+
+static inline int
+lsm3_base_component(Lsm3DictEntry* entry)
+{
+	return LSM3_NUM_TOP_INDEXES + entry->num_levels;
+}
+
+static Oid
+lsm3_component_oid(Lsm3DictEntry* entry, int component)
+{
+	if (component < LSM3_NUM_TOP_INDEXES)
+		return entry->top[component];
+
+	if (component < LSM3_NUM_TOP_INDEXES + entry->num_levels)
+		return entry->level[component - LSM3_NUM_TOP_INDEXES];
+
+	Assert(component == lsm3_base_component(entry));
+	return entry->base;
 }
 
 /* Lookup or create Lsm3 control data for this index */
@@ -161,7 +219,12 @@ lsm3_get_entry(Relation index)
 	{
 		char* relname = RelationGetRelationName(index);
 		lsm3_init_entry(entry, index);
-		for (int i = 0; i < 2; i++)
+
+		/*
+		 * LSM3 MULTI-LEVEL CHANGE:
+		 * Reconstruct both top indexes and configured level indexes from catalog names after restart/cache miss.
+		 */
+		for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 		{
 			char* topidxname = psprintf("%s_top%d", relname, i);
 			entry->top[i] = get_relname_relid(topidxname, RelationGetNamespace(index));
@@ -170,11 +233,23 @@ lsm3_get_entry(Relation index)
 				elog(ERROR, "Lsm3: failed to lookup %s index", topidxname);
 			}
 		}
+
+		for (int i = 0; i < entry->num_levels; i++)
+		{
+			char* levelidxname = psprintf("%s_level%d", relname, i);
+			entry->level[i] = get_relname_relid(levelidxname, RelationGetNamespace(index));
+			if (entry->level[i] == InvalidOid)
+			{
+				elog(ERROR, "Lsm3: failed to lookup %s index", levelidxname);
+			}
+		}
+
 		entry->active_index = lsm3_get_index_size(entry->top[0]) >= lsm3_get_index_size(entry->top[1]) ? 0 : 1;
 	}
 	LWLockRelease(Lsm3DictLock);
 	return entry;
 }
+
 
 /* Launch merger bgworker */
 static void
@@ -307,14 +382,23 @@ lsm3_options(Datum reloptions, bool validate)
 		{"deduplicate_items", RELOPT_TYPE_BOOL,
 		 offsetof(BTOptions, deduplicate_items)},
 		{"top_index_size", RELOPT_TYPE_INT, offsetof(Lsm3Options, top_index_size)},
+
+		/*
+		 * LSM3 MULTI-LEVEL CHANGE:
+		 * Parse runtime level configuration from reloptions and store it in Lsm3Options.
+		 */
+		{"num_levels", RELOPT_TYPE_INT, offsetof(Lsm3Options, num_levels)},
+		{"level_size_ratio", RELOPT_TYPE_INT, offsetof(Lsm3Options, level_size_ratio)},
+
 		{"unique", RELOPT_TYPE_BOOL, offsetof(Lsm3Options, unique)}
 	};
 	return (bytea *) build_reloptions(reloptions, validate, Lsm3ReloptKind,
 									  sizeof(Lsm3Options), tab, lengthof(tab));
 }
 
+
 /* Main function of merger bgwroker */
-void
+PGDLLEXPORT void
 lsm3_merger_main(Datum arg)
 {
 	Lsm3DictEntry* entry = (Lsm3DictEntry*)DatumGetPointer(arg);
@@ -499,6 +583,7 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	uint64 n_merges; /* used to check if merge was initiated by somebody else */
 	Relation index;
 	Oid  save_am;
+	BlockNumber top_blocks;
 	bool overflow;
 	int top_index_size = entry->top_index_size ? entry->top_index_size : Lsm3TopIndexSize;
 	bool is_initialized = true;
@@ -528,32 +613,32 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	}
 	/* Do insert in top index */
 	index = index_open(entry->top[active_index], RowExclusiveLock);
-	index->rd_rel->relam = BTREE_AM_OID;
+
+	/*
+	 * LSM3 CLEANUP CHANGE:
+	 * Save the original AM before temporarily treating the auxiliary relation as a B-Tree.
+	 * We also read the block count before index_close(), because the Relation pointer is not valid after close.
+	 */
 	save_am = index->rd_rel->relam;
+	index->rd_rel->relam = BTREE_AM_OID;
 
-	// /* ==========================================================
-	//  * INJECTION 1: BLOOM FILTER ADDITION
-	//  * ========================================================== */
-
-	// if (active_bloom == NULL)
-	// {
-	// 	active_bloom = bloom_create(1024 * 1024, 3); /* 1MB Demo Filter */
-	// }
-	// /* Add the inserted value to our Bloom Filter */
-	// bloom_add(active_bloom, &values[0], sizeof(values[0]));
-	// /* ========================================================== */
+	/*
+	 * LSM3 MULTI-LEVEL CHANGE:
+	 * Removed checkpoint Bloom insertion; inserts now only update the active top index.
+	 */
 
 	btinsert(index, values, isnull, ht_ctid, heapRel, checkUnique,
 #if PG_VERSION_NUM>=140000
 			 indexUnchanged,
 #endif
 			 indexInfo);
-	index_close(index, RowExclusiveLock);
+	top_blocks = RelationGetNumberOfBlocks(index);
 	index->rd_rel->relam = save_am;
+	index_close(index, RowExclusiveLock);
 
 	overflow = !entry->merge_in_progress /* do not check for overflow if merge was already initiated */
  		&& (entry->n_inserts % LSM3_CHECK_TOP_INDEX_SIZE_PERIOD) == 0 /* perform check only each N-th insert  */
-		&& RelationGetNumberOfBlocks(index)*(BLCKSZ/1024) > top_index_size;
+		&& top_blocks*(BLCKSZ/1024) > top_index_size;
 
 	SpinLockAcquire(&entry->spinlock);
 	/* If merge was not initiated before by somebody else, then do it */
@@ -563,16 +648,10 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 		entry->merge_in_progress = true;
 		entry->active_index ^= 1; /* swap top indexes */
 		entry->n_merges += 1;
-		// /* ==========================================================
-		//  * INJECTION 4: BLOOM FILTER RESET
-		//  * We clear the memory here in the frontend process the exact 
-		//  * moment the trees swap, safely avoiding a background segfault.
-		//  * ========================================================== */
-		// if (active_bloom != NULL) {
-		// 	memset(active_bloom->bits, 0, active_bloom->size_in_bytes);
-		// 	elog(LOG, "BLOOM FILTER RESET: Active tree swapped, filter cleared.");
-		// }
-		// /* ========================================================== */
+		/*
+		 * LSM3 MULTI-LEVEL CHANGE:
+		 * Bloom reset removed; later Bloom filters should be maintained per LSM component.
+		 */
 	}
 	Assert(entry->access_count[active_index] > 0);
 	entry->access_count[active_index] -= 1;
@@ -628,6 +707,7 @@ lsm3_beginscan(Relation rel, int nkeys, int norderbys)
 	IndexScanDesc scan;
 	Lsm3ScanOpaque* so;
 	int i;
+	int base_component;
 
 	/* no order by operators allowed */
 	Assert(norderbys == 0);
@@ -635,25 +715,38 @@ lsm3_beginscan(Relation rel, int nkeys, int norderbys)
 	/* get the scan */
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 	scan->xs_itupdesc = RelationGetDescr(rel);
-	so = (Lsm3ScanOpaque*)palloc(sizeof(Lsm3ScanOpaque));
+
+	/*
+	 * LSM3 MULTI-LEVEL CHANGE:
+	 * Allocate zeroed scan opaque and open every active component: top0, top1, level0..levelN-1, and base.
+	 */
+	so = (Lsm3ScanOpaque*)palloc0(sizeof(Lsm3ScanOpaque));
 	so->entry = lsm3_get_entry(rel);
 	so->sortKeys = lsm3_build_sortkeys(rel);
-	for (i = 0; i < 2; i++)
+	so->ncomponents = lsm3_num_components(so->entry);
+	base_component = lsm3_base_component(so->entry);
+
+	for (i = 0; i < so->ncomponents; i++)
 	{
-		if (so->entry->top[i])
+		Oid component_oid = lsm3_component_oid(so->entry, i);
+
+		if (i == base_component)
 		{
-			so->top_index[i] = index_open(so->entry->top[i], AccessShareLock);
-			so->scan[i] = btbeginscan(so->top_index[i], nkeys, norderbys);
+			/* Base index is the main relation passed to ambeginscan; do not reopen or close it. */
+			so->component_index[i] = NULL;
+			so->scan[i] = btbeginscan(rel, nkeys, norderbys);
+		}
+		else if (component_oid != InvalidOid)
+		{
+			so->component_index[i] = index_open(component_oid, AccessShareLock);
+			so->scan[i] = btbeginscan(so->component_index[i], nkeys, norderbys);
 		}
 		else
 		{
-			so->top_index[i] = NULL;
+			so->component_index[i] = NULL;
 			so->scan[i] = NULL;
 		}
-	}
-	so->scan[2] = btbeginscan(rel, nkeys, norderbys);
-	for (i = 0; i < 3; i++)
-	{
+
 		if (so->scan[i])
 		{
 			so->eof[i] = false;
@@ -661,6 +754,7 @@ lsm3_beginscan(Relation rel, int nkeys, int norderbys)
 			so->scan[i]->parallel_scan = NULL;
 		}
 	}
+
 	so->unique = rel->rd_options ? ((Lsm3Options*)rel->rd_options)->unique : false;
 	so->curr_index = -1;
 	scan->opaque = so;
@@ -674,8 +768,12 @@ lsm3_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 {
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*) scan->opaque;
 
+	/*
+	 * LSM3 MULTI-LEVEL CHANGE:
+	 * Rescan all active components instead of the old fixed three scans.
+	 */
 	so->curr_index = -1;
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < so->ncomponents; i++)
 	{
 		if (so->scan[i])
 		{
@@ -690,14 +788,18 @@ lsm3_endscan(IndexScanDesc scan)
 {
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*) scan->opaque;
 
-	for (int i = 0; i < 3; i++)
+	/*
+	 * LSM3 MULTI-LEVEL CHANGE:
+	 * End all active component scans and close only auxiliary component relations.
+	 */
+	for (int i = 0; i < so->ncomponents; i++)
 	{
 		if (so->scan[i])
 		{
 			btendscan(so->scan[i]);
-			if (i < 2)
+			if (so->component_index[i])
 			{
-				index_close(so->top_index[i], AccessShareLock);
+				index_close(so->component_index[i], AccessShareLock);
 			}
 		}
 	}
@@ -711,64 +813,41 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*) scan->opaque;
 	int min = -1;
 	int curr = so->curr_index;
-	/* We start with active top index, then merging index and last of all: largest base index */
-	int try_index_order[3] = {so->entry->active_index, 1-so->entry->active_index, 2};
+	int try_index_order[LSM3_MAX_COMPONENTS];
+	int order_count = 0;
 
 	/* btree indexes are never lossy */
 	scan->xs_recheck = false;
 
-	// /* ==========================================================
-	//  * INJECTION 2: BLOOM FILTER CHECK
-	//  * ========================================================== */
-	// extern BloomFilter *active_bloom;
-	// if (active_bloom != NULL && scan->numberOfKeys > 0)
-	// {
-	// 	Datum search_key = scan->keyData[0].sk_argument;
-
-	// 	if (!bloom_check(active_bloom, &search_key, sizeof(search_key)))
-	// 	{
-	// 		/* Hit! The key is definitely not here. */
-	// 		elog(INFO, "BLOOM FILTER HIT: Bypassing disk scan for this key.");
-	// 		return false;
-	// 	}
-	// }
-	// /* ========================================================== */
-
-
-
-	// /* ==========================================================
-	//  * INJECTION 2: BLOOM FILTER CHECK (ARCHITECTURALLY CORRECT)
-	//  * ========================================================== */
-	// extern BloomFilter *active_bloom;
-	
-	// /* Only check the Bloom filter if the Active tree hasn't already been marked EOF */
-	// if (active_bloom != NULL && scan->numberOfKeys > 0 && !so->eof[so->entry->active_index])
-	// {
-	// 	Datum search_key = scan->keyData[0].sk_argument;
-
-	// 	if (!bloom_check(active_bloom, &search_key, sizeof(search_key)))
-	// 	{
-	// 		/* Hit! The key is definitely not in the ACTIVE tree. */
-	// 		/* Do NOT return false here! Instead, mark only the active tree as exhausted. */
-	// 		so->eof[so->entry->active_index] = true; 
-	// 		elog(INFO, "BLOOM FILTER HIT: Bypassing Active Tree search.");
-	// 	}
-	// }
-	// /* ========================================================== */
-
-
-
-
+	/*
+	 * LSM3 MULTI-LEVEL CHANGE:
+	 * Build newest-to-oldest component order dynamically:
+	 * active top, inactive top, level0..levelN-1, then base.
+	 */
+	try_index_order[order_count++] = so->entry->active_index;
+	try_index_order[order_count++] = 1 - so->entry->active_index;
+	for (int level = 0; level < so->entry->num_levels; level++)
+	{
+		try_index_order[order_count++] = LSM3_NUM_TOP_INDEXES + level;
+	}
+	try_index_order[order_count++] = lsm3_base_component(so->entry);
 
 	if (curr >= 0) /* lazy advance of current index */
 	{
 		so->eof[curr] = !_bt_next(so->scan[curr], dir); /* move forward current index */
 	}
 
-	for (int j = 0; j < 3; j++)
+	for (int j = 0; j < order_count; j++)
 	{
 		int i = try_index_order[j];
-		BTScanOpaque bto = (BTScanOpaque)so->scan[i]->opaque;
+		BTScanOpaque bto;
+
+		if (i >= so->ncomponents || so->scan[i] == NULL)
+		{
+			continue;
+		}
+
+		bto = (BTScanOpaque)so->scan[i]->opaque;
 		so->scan[i]->xs_snapshot = scan->xs_snapshot;
 		if (!so->eof[i] && !BTScanPosIsValid(bto->currPos))
 		{
@@ -777,12 +856,15 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 			{
 				/* If index is marked as unique and we perform lookup using all index keys,
 				 * then we can stop after locating first occurrence.
-				 * If make it possible to avoid lookups of all three indexes.
+				 * LSM3 MULTI-LEVEL CHANGE: this now skips all remaining dynamic components, not just three indexes.
 				 */
 				elog(DEBUG1, "Lsm3: lookup %d indexes", j+1);
-				while (++j < 3) /* prevent search of all remanining indexes */
+				while (++j < order_count) /* prevent search of all remaining indexes */
 				{
-					so->eof[try_index_order[j]] = true;
+					if (try_index_order[j] < so->ncomponents)
+					{
+						so->eof[try_index_order[j]] = true;
+					}
 				}
 				min = i;
 				break;
@@ -828,22 +910,14 @@ static int64
 lsm3_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*)scan->opaque;
-	// /* ==========================================================
-	//  * INJECTION 3: BLOOM FILTER CHECK FOR BITMAP SCANS
-	//  * ========================================================== */
-	// extern BloomFilter *active_bloom;
-	// if (active_bloom != NULL && scan->numberOfKeys > 0)
-	// {
-	// 	Datum search_key = scan->keyData[0].sk_argument;
-	// 	if (!bloom_check(active_bloom, &search_key, sizeof(search_key)))
-	// 	{
-	// 		elog(INFO, "BLOOM FILTER HIT: Bypassing disk scan for this key (Bitmap Scan).");
-	// 		return 0; /* Instantly return 0 matching rows! */
-	// 	}
-	// }
-	// /* ========================================================== */
 	int64 ntids = 0;
-	for (int i = 0; i < 3; i++)
+
+	/*
+	 * LSM3 MULTI-LEVEL CHANGE:
+	 * Bitmap scan now visits every active component instead of two top indexes plus base only.
+	 * Bloom-filter skip logic is intentionally removed in this first multi-level patch.
+	 */
+	for (int i = 0; i < so->ncomponents; i++)
 	{
 		if (so->scan[i])
 		{
@@ -852,44 +926,8 @@ lsm3_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		}
 	}
 	return ntids;
-
-
-
-
-
-	// /* ==========================================================
-	// //  * INJECTION 3: BLOOM FILTER CHECK FOR BITMAP SCANS
-	// //  * ========================================================== */
-	// int64 ntids = 0;
-	// extern BloomFilter *active_bloom;
-	// bool skip_active = false;
-
-	// if (active_bloom != NULL && scan->numberOfKeys > 0)
-	// {
-	// 	Datum search_key = scan->keyData[0].sk_argument;
-	// 	if (!bloom_check(active_bloom, &search_key, sizeof(search_key)))
-	// 	{
-	// 		elog(INFO, "BLOOM FILTER HIT: Bypassing Active Tree (Bitmap Scan).");
-	// 		skip_active = true;
-	// 	}
-	// }
-
-	// for (int i = 0; i < 3; i++)
-	// {
-	// 	if (so->scan[i])
-	// 	{
-	// 		/* If the Bloom filter fired, skip the active index */
-	// 		if (skip_active && i == so->entry->active_index) {
-	// 			continue;
-	// 		}
-			
-	// 		so->scan[i]->xs_snapshot = scan->xs_snapshot;
-	// 		ntids += btgetbitmap(so->scan[i], tbm);
-	// 	}
-	// }
-	// return ntids;
-	// // /* ========================================================== */
 }
+
 
 Datum
 lsm3_handler(PG_FUNCTION_ARGS)
@@ -1095,7 +1133,12 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 					{
 						drop_objects = new_object_addresses();
 					}
-					for (int i = 0; i < 2; i++)
+
+					/*
+					 * LSM3 MULTI-LEVEL CHANGE:
+					 * Drop cleanup must remove both top indexes and configured level indexes.
+					 */
+					for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 					{
 						if (entry->top[i])
 						{
@@ -1106,6 +1149,18 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 							add_exact_object_address(&obj, drop_objects);
 						}
 					}
+					for (int i = 0; i < entry->num_levels; i++)
+					{
+						if (entry->level[i])
+						{
+							ObjectAddress obj;
+							obj.classId = RelationRelationId;
+							obj.objectId = entry->level[i];
+							obj.objectSubId = 0;
+							add_exact_object_address(&obj, drop_objects);
+						}
+					}
+
 					drop_oids = lappend_oid(drop_oids, RelationGetRelid(index));
 				}
 				relation_close(index, ExclusiveLock);
@@ -1134,14 +1189,29 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 		foreach (cell, Lsm3Entries)
 		{
 			Lsm3DictEntry* entry = (Lsm3DictEntry*)lfirst(cell);
-			Oid top_index[2];
+			Oid top_index[LSM3_NUM_TOP_INDEXES];
+			Oid level_index[LSM3_MAX_LEVELS];
+
+			for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
+			{
+				top_index[i] = InvalidOid;
+			}
+			for (int i = 0; i < LSM3_MAX_LEVELS; i++)
+			{
+				level_index[i] = InvalidOid;
+			}
+
 			if (IsA(parseTree, IndexStmt)) /* This is Lsm3 creation statement */
 			{
 				IndexStmt* stmt = (IndexStmt*)parseTree;
 				char* originIndexName = stmt->idxname;
 				char* originAccessMethod = stmt->accessMethod;
 
-				for (int i = 0; i < 2; i++)
+				/*
+				 * LSM3 MULTI-LEVEL CHANGE:
+				 * Create two L0 top indexes plus entry->num_levels level indexes using the wrapper AM.
+				 */
+				for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 				{
 					if (stmt->concurrent)
 					{
@@ -1149,23 +1219,54 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 					}
 					stmt->accessMethod = "lsm3_btree_wrapper";
 					stmt->idxname = psprintf("%s_top%d", get_rel_name(entry->base), i);
+
+					/* PG16 requires 11 arguments (added total_parts as the 6th argument) */
 					top_index[i] = DefineIndex(entry->heap,
 											   stmt,
 											   InvalidOid,
 											   InvalidOid,
 											   InvalidOid,
+											   -1,      /* NEW IN PG16: total_parts */
 											   false,
 											   false,
 											   false,
 											   false,
 											   true).objectId;
 				}
+
+				for (int i = 0; i < entry->num_levels; i++)
+				{
+					if (stmt->concurrent)
+					{
+						PushActiveSnapshot(GetTransactionSnapshot());
+					}
+					stmt->accessMethod = "lsm3_btree_wrapper";
+					stmt->idxname = psprintf("%s_level%d", get_rel_name(entry->base), i);
+
+					/* PG16 requires 11 arguments (added total_parts as the 6th argument) */
+					level_index[i] = DefineIndex(entry->heap,
+												 stmt,
+												 InvalidOid,
+												 InvalidOid,
+												 InvalidOid,
+												 -1,      /* NEW IN PG16: total_parts */
+												 false,
+												 false,
+												 false,
+												 false,
+												 true).objectId;
+				}
+
 				stmt->accessMethod = originAccessMethod;
 				stmt->idxname = originIndexName;
 			}
 			else
 			{
-				for (int i = 0; i < 2; i++)
+				/*
+				 * LSM3 MULTI-LEVEL CHANGE:
+				 * For non-creation utility paths, recover all auxiliary index OIDs by name.
+				 */
+				for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 				{
 					top_index[i] = entry->top[i];
 					if (top_index[i] == InvalidOid)
@@ -1178,6 +1279,19 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 						}
 					}
 				}
+				for (int i = 0; i < entry->num_levels; i++)
+				{
+					level_index[i] = entry->level[i];
+					if (level_index[i] == InvalidOid)
+					{
+						char* levelidxname = psprintf("%s_level%d", get_rel_name(entry->base), i);
+						level_index[i] = get_relname_relid(levelidxname, get_rel_namespace(entry->base));
+						if (level_index[i] == InvalidOid)
+						{
+							elog(ERROR, "Lsm3: failed to lookup %s index", levelidxname);
+						}
+					}
+				}
 			}
 			if (ActiveSnapshotSet())
 			{
@@ -1185,15 +1299,28 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 			}
 			CommitTransactionCommand();
 			StartTransactionCommand();
-			/*  Mark top index as invalid to prevent planner from using it in queries */
-			for (int i = 0; i < 2; i++)
+
+			/*
+			 * LSM3 MULTI-LEVEL CHANGE:
+			 * Mark every auxiliary index invalid so the planner never chooses top/level indexes directly.
+			 */
+			for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 			{
 				index_set_state_flags(top_index[i], INDEX_DROP_CLEAR_VALID);
 			}
+			for (int i = 0; i < entry->num_levels; i++)
+			{
+				index_set_state_flags(level_index[i], INDEX_DROP_CLEAR_VALID);
+			}
+
 			SpinLockAcquire(&entry->spinlock);
-			for (int i = 0; i < 2; i++)
+			for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 			{
 				entry->top[i] = top_index[i];
+			}
+			for (int i = 0; i < entry->num_levels; i++)
+			{
+				entry->level[i] = level_index[i];
 			}
 			SpinLockRelease(&entry->spinlock);
 			{
@@ -1216,6 +1343,7 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 		LWLockRelease(Lsm3DictLock);
 	}
 }
+
 
 /*
  * Executor finish hook to reclaim released locks on non-active top indexes
@@ -1275,6 +1403,18 @@ _PG_init(void)
 	add_int_reloption(Lsm3ReloptKind, "top_index_size",
 					  "Size of top index (kb)",
 					  0, 0, INT_MAX, AccessExclusiveLock);
+
+	/*
+	 * LSM3 MULTI-LEVEL CHANGE:
+	 * num_levels controls how many intermediate level indexes are created; ratio is reserved for level thresholds.
+	 */
+	add_int_reloption(Lsm3ReloptKind, "num_levels",
+					  "Number of intermediate LSM levels",
+					  LSM3_DEFAULT_LEVELS, 1, LSM3_MAX_LEVELS, AccessExclusiveLock);
+	add_int_reloption(Lsm3ReloptKind, "level_size_ratio",
+					  "Size multiplier between LSM levels",
+					  LSM3_DEFAULT_LEVEL_SIZE_RATIO, 2, INT_MAX, AccessExclusiveLock);
+
 	add_int_reloption(Lsm3ReloptKind, "fillfactor",
 					  "Packs btree index pages only to this percentage",
 					  BTREE_DEFAULT_FILLFACTOR, BTREE_MIN_FILLFACTOR, 100, ShareUpdateExclusiveLock);
@@ -1288,9 +1428,12 @@ _PG_init(void)
 	PreviousShmemStartupHook = shmem_startup_hook;
 	shmem_startup_hook = lsm3_shmem_startup;
 
+	PreviousShmemRequestHook = shmem_request_hook;
+	shmem_request_hook = lsm3_shmem_request;
+
 	// lsm3_shmem_request();
-	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
-	RequestNamedLWLockTranche("lsm3", 1);
+	// RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
+	// RequestNamedLWLockTranche("lsm3", 1);
 
 	PreviousProcessUtilityHook = ProcessUtility_hook;
     ProcessUtility_hook = lsm3_process_utility;
@@ -1363,5 +1506,9 @@ lsm3_top_index_size(PG_FUNCTION_ARGS)
 	Relation index = index_open(relid, AccessShareLock);
 	Lsm3DictEntry* entry = lsm3_get_entry(index);
 	index_close(index, AccessShareLock);
-	PG_RETURN_INT64((uint64)lsm3_get_index_size(lsm3_get_index_size(entry->top[entry->active_index]))*BLCKSZ);
+	/*
+	 * LSM3 CLEANUP CHANGE:
+	 * Return the active top index size directly; the previous nested lsm3_get_index_size() call used a block count as an OID.
+	 */
+	PG_RETURN_INT64((uint64)lsm3_get_index_size(entry->top[entry->active_index]) * BLCKSZ);
 }
