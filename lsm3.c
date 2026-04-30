@@ -51,7 +51,7 @@ extern void	_PG_init(void);
 extern void	_PG_fini(void);
 
 /*
- * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+ * LSM3 MULTI-RUN LEVEL CHANGE:
  * Export the background worker entry point because RegisterDynamicBackgroundWorker() resolves it by name.
  */
 extern PGDLLEXPORT void lsm3_merger_main(Datum arg);
@@ -82,7 +82,7 @@ static int Lsm3TopIndexSize;
 static volatile bool Lsm3Cancel;
 
 /*
- * LSM3 MULTI-LEVEL CHANGE:
+ * LSM3 MULTI-RUN LEVEL CHANGE:
  * Bloom-filter checkpoint code was removed from this file so the multi-level layout can be implemented first.
  * Bloom filters should later be reintroduced per component instead of as one global active-tree filter.
  */
@@ -123,8 +123,8 @@ static void
 lsm3_init_entry(Lsm3DictEntry* entry, Relation index)
 {
 	/*
-	 * LSM3 MULTI-LEVEL CHANGE:
-	 * Initialize fixed-capacity metadata for configurable levels; only entry->num_levels slots are used at runtime.
+	 * LSM3 MULTI-RUN LEVEL CHANGE:
+	 * Initialize fixed-capacity metadata for configurable levels and multiple immutable runs per level.
 	 */
 	Lsm3Options* opts = index->rd_options ? (Lsm3Options*)index->rd_options : NULL;
 
@@ -142,9 +142,13 @@ lsm3_init_entry(Lsm3DictEntry* entry, Relation index)
 		entry->access_count[i] = 0;
 	}
 
-	for (int i = 0; i < LSM3_MAX_LEVELS; i++)
+	for (int level_no = 0; level_no < LSM3_MAX_LEVELS; level_no++)
 	{
-		entry->level[i] = InvalidOid;
+		entry->level_run_count[level_no] = 0;
+		for (int run_no = 0; run_no < LSM3_MAX_RUNS_PER_LEVEL; run_no++)
+		{
+			entry->level[level_no][run_no] = InvalidOid;
+		}
 	}
 
 	entry->num_levels = opts ? opts->num_levels : LSM3_DEFAULT_LEVELS;
@@ -152,6 +156,12 @@ lsm3_init_entry(Lsm3DictEntry* entry, Relation index)
 		entry->num_levels = 1;
 	if (entry->num_levels > LSM3_MAX_LEVELS)
 		entry->num_levels = LSM3_MAX_LEVELS;
+
+	entry->runs_per_level = opts ? opts->runs_per_level : LSM3_DEFAULT_RUNS_PER_LEVEL;
+	if (entry->runs_per_level < 1)
+		entry->runs_per_level = 1;
+	if (entry->runs_per_level > LSM3_MAX_RUNS_PER_LEVEL)
+		entry->runs_per_level = LSM3_MAX_RUNS_PER_LEVEL;
 
 	entry->level_size_ratio = opts ? opts->level_size_ratio : LSM3_DEFAULT_LEVEL_SIZE_RATIO;
 	if (entry->level_size_ratio < 2)
@@ -175,33 +185,60 @@ lsm3_get_index_size(Oid relid)
 
 
 /*
- * LSM3 MULTI-LEVEL CHANGE:
- * Component helpers map logical scan/compaction component numbers to physical index OIDs.
- * Layout: 0=top0, 1=top1, 2..(2+num_levels-1)=levels, last=base.
+ * LSM3 MULTI-RUN LEVEL CHANGE:
+ * Component helpers map logical scan component numbers to physical index OIDs.
+ * Layout: 0=top0, 1=top1, then level0_run0..level0_runR, level1_run0.., and last=base.
  */
+static inline int
+lsm3_level_component(Lsm3DictEntry* entry, int level_no, int run_no)
+{
+	return LSM3_NUM_TOP_INDEXES + (level_no * entry->runs_per_level) + run_no;
+}
+
 static inline int
 lsm3_num_components(Lsm3DictEntry* entry)
 {
-	return LSM3_NUM_TOP_INDEXES + entry->num_levels + 1;
+	return LSM3_NUM_TOP_INDEXES + (entry->num_levels * entry->runs_per_level) + 1;
 }
 
 static inline int
 lsm3_base_component(Lsm3DictEntry* entry)
 {
-	return LSM3_NUM_TOP_INDEXES + entry->num_levels;
+	return LSM3_NUM_TOP_INDEXES + (entry->num_levels * entry->runs_per_level);
 }
 
 static Oid
 lsm3_component_oid(Lsm3DictEntry* entry, int component)
 {
+	int level_slot;
+	int level_no;
+	int run_no;
+
 	if (component < LSM3_NUM_TOP_INDEXES)
 		return entry->top[component];
 
-	if (component < LSM3_NUM_TOP_INDEXES + entry->num_levels)
-		return entry->level[component - LSM3_NUM_TOP_INDEXES];
+	if (component == lsm3_base_component(entry))
+		return entry->base;
 
-	Assert(component == lsm3_base_component(entry));
-	return entry->base;
+	level_slot = component - LSM3_NUM_TOP_INDEXES;
+	level_no = level_slot / entry->runs_per_level;
+	run_no = level_slot % entry->runs_per_level;
+
+	Assert(level_no >= 0 && level_no < entry->num_levels);
+	Assert(run_no >= 0 && run_no < entry->runs_per_level);
+
+	return entry->level[level_no][run_no];
+}
+
+/*
+ * LSM3 MULTI-RUN LEVEL CHANGE:
+ * A freshly built empty auxiliary B-tree has only its metapage. Once it receives real tuples it grows beyond one page.
+ * This helper is used after restart to reconstruct the occupied-run prefix conservatively.
+ */
+static bool
+lsm3_run_has_data(Oid index_oid)
+{
+	return OidIsValid(index_oid) && lsm3_get_index_size(index_oid) > 1;
 }
 
 /* Lookup or create Lsm3 control data for this index */
@@ -225,8 +262,9 @@ lsm3_get_entry(Relation index)
 		lsm3_init_entry(entry, index);
 
 		/*
-		 * LSM3 MULTI-LEVEL CHANGE:
-		 * Reconstruct both top indexes and configured level indexes from catalog names after restart/cache miss.
+		 * LSM3 MULTI-RUN LEVEL CHANGE:
+		 * Reconstruct top indexes and all configured level-run indexes from catalog names after restart/cache miss.
+		 * level_run_count[] is reconstructed from non-empty prefix runs.
 		 */
 		for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 		{
@@ -238,13 +276,20 @@ lsm3_get_entry(Relation index)
 			}
 		}
 
-		for (int i = 0; i < entry->num_levels; i++)
+		for (int level_no = 0; level_no < entry->num_levels; level_no++)
 		{
-			char* levelidxname = psprintf("%s_level%d", relname, i);
-			entry->level[i] = get_relname_relid(levelidxname, RelationGetNamespace(index));
-			if (entry->level[i] == InvalidOid)
+			entry->level_run_count[level_no] = 0;
+			for (int run_no = 0; run_no < entry->runs_per_level; run_no++)
 			{
-				elog(ERROR, "Lsm3: failed to lookup %s index", levelidxname);
+				char* levelidxname = psprintf("%s_level%d_run%d", relname, level_no, run_no);
+				entry->level[level_no][run_no] = get_relname_relid(levelidxname, RelationGetNamespace(index));
+				if (entry->level[level_no][run_no] == InvalidOid)
+				{
+					elog(ERROR, "Lsm3: failed to lookup %s index", levelidxname);
+				}
+
+				if (lsm3_run_has_data(entry->level[level_no][run_no]))
+					entry->level_run_count[level_no] = run_no + 1;
 			}
 		}
 
@@ -323,7 +368,7 @@ lsm3_truncate_index(Oid index_oid, Oid heap_oid)
 #endif
 
 /*
- * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+ * LSM3 MULTI-RUN LEVEL CHANGE:
  * Merge any source component into any destination component.
  * The old code only used this as "top index -> base index"; cascading compaction now also uses it for level[i] -> level[i+1].
  */
@@ -379,8 +424,26 @@ lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
 }
 
 /*
- * LSM3 MULTI-LEVEL COMPACTION CHANGE:
- * Compute the size limit for level[level_no] in KB.
+ * LSM3 MULTI-RUN LEVEL CHANGE:
+ * Compute the total size of all occupied runs in a level in KB.
+ */
+static int64
+lsm3_level_size_kb(Lsm3DictEntry* entry, int level_no)
+{
+	int64 total_kb = 0;
+
+	for (int run_no = 0; run_no < entry->level_run_count[level_no]; run_no++)
+	{
+		Oid run_oid = entry->level[level_no][run_no];
+		if (OidIsValid(run_oid))
+			total_kb += (int64)lsm3_get_index_size(run_oid) * (BLCKSZ / 1024);
+	}
+	return total_kb;
+}
+
+/*
+ * LSM3 MULTI-RUN LEVEL CHANGE:
+ * Compute the size limit for a whole level in KB.
  * Formula: level0 = top_size * ratio, level1 = top_size * ratio^2, ...
  */
 static int64
@@ -398,62 +461,149 @@ lsm3_level_threshold_kb(Lsm3DictEntry* entry, int level_no)
 }
 
 /*
- * LSM3 MULTI-LEVEL COMPACTION CHANGE:
- * Return true when an index relation is larger than its configured compaction threshold.
- * Sizes are compared in KB to match the existing top_index_size option.
+ * LSM3 MULTI-RUN LEVEL CHANGE:
+ * A level should compact when it has filled all available run slots or when its total size exceeds its threshold.
  */
 static bool
-lsm3_index_exceeds_threshold(Oid index_oid, int64 threshold_kb)
+lsm3_level_should_compact(Lsm3DictEntry* entry, int level_no)
 {
-	BlockNumber blocks = lsm3_get_index_size(index_oid);
-	int64 size_kb = (int64)blocks * (BLCKSZ / 1024);
+	int run_count = entry->level_run_count[level_no];
+	int64 threshold_kb = lsm3_level_threshold_kb(entry, level_no);
+	int64 size_kb = lsm3_level_size_kb(entry, level_no);
 
-	return size_kb > threshold_kb;
+	return run_count >= entry->runs_per_level || size_kb > threshold_kb;
+}
+
+static void lsm3_compact_level(Lsm3DictEntry* entry, int level_no);
+
+/*
+ * LSM3 MULTI-RUN LEVEL CHANGE:
+ * Add a source component as a new immutable run in level_no. If the destination level is full,
+ * compact it first to make a free run slot. After adding, compact the level if it crosses its
+ * run-count or size threshold.
+ */
+static void
+lsm3_add_component_to_level(Lsm3DictEntry* entry, int level_no, Oid src_oid, const char *src_desc)
+{
+	Oid dst_oid;
+	int dst_run;
+
+	if (level_no >= entry->num_levels)
+	{
+		elog(LOG, "Lsm3: merge %s directly into base", src_desc);
+		lsm3_merge_indexes(entry->base, src_oid, entry->heap);
+		lsm3_truncate_index(src_oid, entry->heap);
+		return;
+	}
+
+	if (entry->level_run_count[level_no] >= entry->runs_per_level)
+	{
+		elog(LOG, "Lsm3: level%d has no free run slot; compacting before adding %s", level_no, src_desc);
+		lsm3_compact_level(entry, level_no);
+	}
+
+	Assert(entry->level_run_count[level_no] < entry->runs_per_level);
+	dst_run = entry->level_run_count[level_no];
+	dst_oid = entry->level[level_no][dst_run];
+
+	if (!OidIsValid(dst_oid))
+		elog(ERROR, "Lsm3: invalid destination run level%d_run%d", level_no, dst_run);
+
+	pgstat_report_activity(STATE_RUNNING, "merging component into level run");
+	elog(LOG, "Lsm3: merge %s into level%d_run%d", src_desc, level_no, dst_run);
+	lsm3_merge_indexes(dst_oid, src_oid, entry->heap);
+
+	pgstat_report_activity(STATE_RUNNING, "truncate source component");
+	lsm3_truncate_index(src_oid, entry->heap);
+
+	entry->level_run_count[level_no] += 1;
+
+	if (lsm3_level_should_compact(entry, level_no))
+	{
+		elog(LOG, "Lsm3: level%d now has %d runs and " INT64_FORMAT " KB; compacting", level_no,
+			 entry->level_run_count[level_no], lsm3_level_size_kb(entry, level_no));
+		lsm3_compact_level(entry, level_no);
+	}
 }
 
 /*
- * LSM3 MULTI-LEVEL COMPACTION CHANGE:
- * Compact the inactive top index into level0, then cascade oversized levels upward.
- * The final configured level is compacted into the base index.
+ * LSM3 MULTI-RUN LEVEL CHANGE:
+ * Tiered compaction for one level. All occupied runs in level_no are merged into one new run
+ * of the next level, or into base if level_no is the last configured level. Source runs are
+ * truncated and their run count is reset to zero.
+ */
+static void
+lsm3_compact_level(Lsm3DictEntry* entry, int level_no)
+{
+	int run_count;
+	Oid dst_oid;
+	int dst_run;
+
+	if (level_no < 0 || level_no >= entry->num_levels)
+		return;
+
+	run_count = entry->level_run_count[level_no];
+	if (run_count <= 0)
+		return;
+
+	pgstat_report_activity(STATE_RUNNING, "tiered level compaction");
+
+	if (level_no + 1 < entry->num_levels)
+	{
+		/* Make sure the next level has a free run slot before we produce a new run there. */
+		if (entry->level_run_count[level_no + 1] >= entry->runs_per_level)
+		{
+			elog(LOG, "Lsm3: compact next level%d first because it is full", level_no + 1);
+			lsm3_compact_level(entry, level_no + 1);
+		}
+
+		Assert(entry->level_run_count[level_no + 1] < entry->runs_per_level);
+		dst_run = entry->level_run_count[level_no + 1];
+		dst_oid = entry->level[level_no + 1][dst_run];
+		if (!OidIsValid(dst_oid))
+			elog(ERROR, "Lsm3: invalid destination run level%d_run%d", level_no + 1, dst_run);
+
+		elog(LOG, "Lsm3: compact %d runs from level%d into level%d_run%d", run_count, level_no, level_no + 1, dst_run);
+	}
+	else
+	{
+		dst_run = -1;
+		dst_oid = entry->base;
+		elog(LOG, "Lsm3: compact %d runs from final level%d into base", run_count, level_no);
+	}
+
+	for (int run_no = 0; run_no < run_count; run_no++)
+	{
+		Oid src_oid = entry->level[level_no][run_no];
+		if (!OidIsValid(src_oid))
+			continue;
+
+		lsm3_merge_indexes(dst_oid, src_oid, entry->heap);
+		lsm3_truncate_index(src_oid, entry->heap);
+	}
+
+	entry->level_run_count[level_no] = 0;
+
+	if (level_no + 1 < entry->num_levels)
+	{
+		entry->level_run_count[level_no + 1] += 1;
+		if (lsm3_level_should_compact(entry, level_no + 1))
+			lsm3_compact_level(entry, level_no + 1);
+	}
+}
+
+/*
+ * LSM3 MULTI-RUN LEVEL CHANGE:
+ * Compact the inactive top index into a new run of level0. Further cascading happens only when
+ * a level fills its run slots or exceeds its configured total-size threshold.
  */
 static void
 lsm3_compact_from_top(Lsm3DictEntry* entry, int top_index)
 {
-	/* First stage: old L0/top component is no longer merged directly into base; it goes to level0. */
-	pgstat_report_activity(STATE_RUNNING, "merging top into level0");
-	elog(LOG, "Lsm3: compact top%d into level0", top_index);
-	lsm3_merge_indexes(entry->level[0], entry->top[top_index], entry->heap);
+	char src_desc[64];
 
-	pgstat_report_activity(STATE_RUNNING, "truncate compacted top");
-	lsm3_truncate_index(entry->top[top_index], entry->heap);
-
-	/* Cascading stage: if a level crosses its threshold, push it to the next level or base. */
-	for (int level_no = 0; level_no < entry->num_levels; level_no++)
-	{
-		Oid src_oid = entry->level[level_no];
-		Oid dst_oid = (level_no + 1 < entry->num_levels) ? entry->level[level_no + 1] : entry->base;
-		int64 threshold_kb = lsm3_level_threshold_kb(entry, level_no);
-
-		if (!OidIsValid(src_oid) || !OidIsValid(dst_oid))
-			continue;
-
-		if (!lsm3_index_exceeds_threshold(src_oid, threshold_kb))
-		{
-			elog(DEBUG1, "Lsm3: level%d remains below threshold " INT64_FORMAT " KB", level_no, threshold_kb);
-			continue;
-		}
-
-		pgstat_report_activity(STATE_RUNNING, "cascading level compaction");
-		elog(LOG, "Lsm3: compact level%d into %s because it exceeded " INT64_FORMAT " KB",
-			 level_no,
-			 (level_no + 1 < entry->num_levels) ? "next level" : "base",
-			 threshold_kb);
-
-		lsm3_merge_indexes(dst_oid, src_oid, entry->heap);
-
-		pgstat_report_activity(STATE_RUNNING, "truncate compacted level");
-		lsm3_truncate_index(src_oid, entry->heap);
-	}
+	snprintf(src_desc, sizeof(src_desc), "top%d", top_index);
+	lsm3_add_component_to_level(entry, 0, entry->top[top_index], src_desc);
 }
 
 /* Lsm3 index options.
@@ -470,10 +620,11 @@ lsm3_options(Datum reloptions, bool validate)
 		{"top_index_size", RELOPT_TYPE_INT, offsetof(Lsm3Options, top_index_size)},
 
 		/*
-		 * LSM3 MULTI-LEVEL CHANGE:
-		 * Parse runtime level configuration from reloptions and store it in Lsm3Options.
+		 * LSM3 MULTI-RUN LEVEL CHANGE:
+		 * Parse runtime level/run configuration from reloptions and store it in Lsm3Options.
 		 */
 		{"num_levels", RELOPT_TYPE_INT, offsetof(Lsm3Options, num_levels)},
+		{"runs_per_level", RELOPT_TYPE_INT, offsetof(Lsm3Options, runs_per_level)},
 		{"level_size_ratio", RELOPT_TYPE_INT, offsetof(Lsm3Options, level_size_ratio)},
 
 		{"unique", RELOPT_TYPE_BOOL, offsetof(Lsm3Options, unique)}
@@ -529,7 +680,7 @@ lsm3_merger_main(Datum arg)
 		if (merge_index >= 0)
 		{
 			/*
-			 * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+			 * LSM3 MULTI-RUN LEVEL CHANGE:
 			 * The worker now performs top -> level0 followed by level cascading.
 			 * The old implementation did only top -> base.
 			 */
@@ -656,7 +807,7 @@ lsm3_reacquire_locks(void)
 
 /*
  * Insert in active top index; on overflow swap active indexes and initiate multi-level compaction.
- * LSM3 MULTI-LEVEL COMPACTION CHANGE: the merge target is now level0 first, not base directly.
+ * LSM3 MULTI-RUN LEVEL CHANGE: the merge target is now level0 first, not base directly.
  */
 static bool
 lsm3_insert(Relation rel, Datum *values, bool *isnull,
@@ -713,7 +864,7 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	index->rd_rel->relam = BTREE_AM_OID;
 
 	/*
-	 * LSM3 MULTI-LEVEL CHANGE:
+	 * LSM3 MULTI-RUN LEVEL CHANGE:
 	 * Removed checkpoint Bloom insertion; inserts now only update the active top index.
 	 */
 
@@ -739,7 +890,7 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 		entry->active_index ^= 1; /* swap top indexes */
 		entry->n_merges += 1;
 		/*
-		 * LSM3 MULTI-LEVEL CHANGE:
+		 * LSM3 MULTI-RUN LEVEL CHANGE:
 		 * Bloom reset removed; later Bloom filters should be maintained per LSM component.
 		 */
 	}
@@ -807,7 +958,7 @@ lsm3_beginscan(Relation rel, int nkeys, int norderbys)
 	scan->xs_itupdesc = RelationGetDescr(rel);
 
 	/*
-	 * LSM3 MULTI-LEVEL CHANGE:
+	 * LSM3 MULTI-RUN LEVEL CHANGE:
 	 * Allocate zeroed scan opaque and open every active component: top0, top1, level0..levelN-1, and base.
 	 */
 	so = (Lsm3ScanOpaque*)palloc0(sizeof(Lsm3ScanOpaque));
@@ -859,7 +1010,7 @@ lsm3_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*) scan->opaque;
 
 	/*
-	 * LSM3 MULTI-LEVEL CHANGE:
+	 * LSM3 MULTI-RUN LEVEL CHANGE:
 	 * Rescan all active components instead of the old fixed three scans.
 	 */
 	so->curr_index = -1;
@@ -879,7 +1030,7 @@ lsm3_endscan(IndexScanDesc scan)
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*) scan->opaque;
 
 	/*
-	 * LSM3 MULTI-LEVEL CHANGE:
+	 * LSM3 MULTI-RUN LEVEL CHANGE:
 	 * End all active component scans and close only auxiliary component relations.
 	 */
 	for (int i = 0; i < so->ncomponents; i++)
@@ -910,15 +1061,24 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 	scan->xs_recheck = false;
 
 	/*
-	 * LSM3 MULTI-LEVEL CHANGE:
+	 * LSM3 MULTI-RUN LEVEL CHANGE:
 	 * Build newest-to-oldest component order dynamically:
-	 * active top, inactive top, level0..levelN-1, then base.
+	 * active top, inactive top, then for each level scan newer runs before older runs, and finally base.
 	 */
 	try_index_order[order_count++] = so->entry->active_index;
 	try_index_order[order_count++] = 1 - so->entry->active_index;
 	for (int level = 0; level < so->entry->num_levels; level++)
 	{
-		try_index_order[order_count++] = LSM3_NUM_TOP_INDEXES + level;
+		/*
+		 * LSM3 MULTI-RUN LEVEL CHANGE:
+		 * Include every configured run, not just level_run_count[level]. During compaction a destination
+		 * run may already contain copied tuples before the run-count metadata is advanced; scanning all
+		 * run slots prevents readers from missing tuples during that transient state.
+		 */
+		for (int run = so->entry->runs_per_level - 1; run >= 0; run--)
+		{
+			try_index_order[order_count++] = lsm3_level_component(so->entry, level, run);
+		}
 	}
 	try_index_order[order_count++] = lsm3_base_component(so->entry);
 
@@ -946,7 +1106,7 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 			{
 				/* If index is marked as unique and we perform lookup using all index keys,
 				 * then we can stop after locating first occurrence.
-				 * LSM3 MULTI-LEVEL CHANGE: this now skips all remaining dynamic components, not just three indexes.
+				 * LSM3 MULTI-RUN LEVEL CHANGE: this now skips all remaining dynamic components, not just three indexes.
 				 */
 				elog(DEBUG1, "Lsm3: lookup %d indexes", j+1);
 				while (++j < order_count) /* prevent search of all remaining indexes */
@@ -1003,7 +1163,7 @@ lsm3_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	int64 ntids = 0;
 
 	/*
-	 * LSM3 MULTI-LEVEL CHANGE:
+	 * LSM3 MULTI-RUN LEVEL CHANGE:
 	 * Bitmap scan now visits every active component instead of two top indexes plus base only.
 	 * Bloom-filter skip logic is intentionally removed in this first multi-level patch.
 	 */
@@ -1225,8 +1385,8 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 					}
 
 					/*
-					 * LSM3 MULTI-LEVEL CHANGE:
-					 * Drop cleanup must remove both top indexes and configured level indexes.
+					 * LSM3 MULTI-RUN LEVEL CHANGE:
+					 * Drop cleanup must remove top indexes and every configured level-run index.
 					 */
 					for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 					{
@@ -1239,15 +1399,18 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 							add_exact_object_address(&obj, drop_objects);
 						}
 					}
-					for (int i = 0; i < entry->num_levels; i++)
+					for (int level_no = 0; level_no < entry->num_levels; level_no++)
 					{
-						if (entry->level[i])
+						for (int run_no = 0; run_no < entry->runs_per_level; run_no++)
 						{
-							ObjectAddress obj;
-							obj.classId = RelationRelationId;
-							obj.objectId = entry->level[i];
-							obj.objectSubId = 0;
-							add_exact_object_address(&obj, drop_objects);
+							if (entry->level[level_no][run_no])
+							{
+								ObjectAddress obj;
+								obj.classId = RelationRelationId;
+								obj.objectId = entry->level[level_no][run_no];
+								obj.objectSubId = 0;
+								add_exact_object_address(&obj, drop_objects);
+							}
 						}
 					}
 
@@ -1280,15 +1443,18 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 		{
 			Lsm3DictEntry* entry = (Lsm3DictEntry*)lfirst(cell);
 			Oid top_index[LSM3_NUM_TOP_INDEXES];
-			Oid level_index[LSM3_MAX_LEVELS];
+			Oid level_index[LSM3_MAX_LEVELS][LSM3_MAX_RUNS_PER_LEVEL];
 
 			for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 			{
 				top_index[i] = InvalidOid;
 			}
-			for (int i = 0; i < LSM3_MAX_LEVELS; i++)
+			for (int level_no = 0; level_no < LSM3_MAX_LEVELS; level_no++)
 			{
-				level_index[i] = InvalidOid;
+				for (int run_no = 0; run_no < LSM3_MAX_RUNS_PER_LEVEL; run_no++)
+				{
+					level_index[level_no][run_no] = InvalidOid;
+				}
 			}
 
 			if (IsA(parseTree, IndexStmt)) /* This is Lsm3 creation statement */
@@ -1298,8 +1464,8 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 				char* originAccessMethod = stmt->accessMethod;
 
 				/*
-				 * LSM3 MULTI-LEVEL CHANGE:
-				 * Create two L0 top indexes plus entry->num_levels level indexes using the wrapper AM.
+				 * LSM3 MULTI-RUN LEVEL CHANGE:
+				 * Create two mutable top indexes and num_levels * runs_per_level immutable level-run indexes.
 				 */
 				for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 				{
@@ -1324,27 +1490,30 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 											   true).objectId;
 				}
 
-				for (int i = 0; i < entry->num_levels; i++)
+				for (int level_no = 0; level_no < entry->num_levels; level_no++)
 				{
-					if (stmt->concurrent)
+					for (int run_no = 0; run_no < entry->runs_per_level; run_no++)
 					{
-						PushActiveSnapshot(GetTransactionSnapshot());
-					}
-					stmt->accessMethod = "lsm3_btree_wrapper";
-					stmt->idxname = psprintf("%s_level%d", get_rel_name(entry->base), i);
+						if (stmt->concurrent)
+						{
+							PushActiveSnapshot(GetTransactionSnapshot());
+						}
+						stmt->accessMethod = "lsm3_btree_wrapper";
+						stmt->idxname = psprintf("%s_level%d_run%d", get_rel_name(entry->base), level_no, run_no);
 
-					/* PG16 requires 11 arguments (added total_parts as the 6th argument) */
-					level_index[i] = DefineIndex(entry->heap,
-												 stmt,
-												 InvalidOid,
-												 InvalidOid,
-												 InvalidOid,
-												 -1,      /* NEW IN PG16: total_parts */
-												 false,
-												 false,
-												 false,
-												 false,
-												 true).objectId;
+						/* PG16 requires 11 arguments (added total_parts as the 6th argument) */
+						level_index[level_no][run_no] = DefineIndex(entry->heap,
+														 stmt,
+														 InvalidOid,
+														 InvalidOid,
+														 InvalidOid,
+														 -1,      /* NEW IN PG16: total_parts */
+														 false,
+														 false,
+														 false,
+														 false,
+														 true).objectId;
+					}
 				}
 
 				stmt->accessMethod = originAccessMethod;
@@ -1353,7 +1522,7 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 			else
 			{
 				/*
-				 * LSM3 MULTI-LEVEL CHANGE:
+				 * LSM3 MULTI-RUN LEVEL CHANGE:
 				 * For non-creation utility paths, recover all auxiliary index OIDs by name.
 				 */
 				for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
@@ -1369,16 +1538,19 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 						}
 					}
 				}
-				for (int i = 0; i < entry->num_levels; i++)
+				for (int level_no = 0; level_no < entry->num_levels; level_no++)
 				{
-					level_index[i] = entry->level[i];
-					if (level_index[i] == InvalidOid)
+					for (int run_no = 0; run_no < entry->runs_per_level; run_no++)
 					{
-						char* levelidxname = psprintf("%s_level%d", get_rel_name(entry->base), i);
-						level_index[i] = get_relname_relid(levelidxname, get_rel_namespace(entry->base));
-						if (level_index[i] == InvalidOid)
+						level_index[level_no][run_no] = entry->level[level_no][run_no];
+						if (level_index[level_no][run_no] == InvalidOid)
 						{
-							elog(ERROR, "Lsm3: failed to lookup %s index", levelidxname);
+							char* levelidxname = psprintf("%s_level%d_run%d", get_rel_name(entry->base), level_no, run_no);
+							level_index[level_no][run_no] = get_relname_relid(levelidxname, get_rel_namespace(entry->base));
+							if (level_index[level_no][run_no] == InvalidOid)
+							{
+								elog(ERROR, "Lsm3: failed to lookup %s index", levelidxname);
+							}
 						}
 					}
 				}
@@ -1391,16 +1563,19 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 			StartTransactionCommand();
 
 			/*
-			 * LSM3 MULTI-LEVEL CHANGE:
-			 * Mark every auxiliary index invalid so the planner never chooses top/level indexes directly.
+			 * LSM3 MULTI-RUN LEVEL CHANGE:
+			 * Mark every auxiliary index invalid so the planner never chooses top/run indexes directly.
 			 */
 			for (int i = 0; i < LSM3_NUM_TOP_INDEXES; i++)
 			{
 				index_set_state_flags(top_index[i], INDEX_DROP_CLEAR_VALID);
 			}
-			for (int i = 0; i < entry->num_levels; i++)
+			for (int level_no = 0; level_no < entry->num_levels; level_no++)
 			{
-				index_set_state_flags(level_index[i], INDEX_DROP_CLEAR_VALID);
+				for (int run_no = 0; run_no < entry->runs_per_level; run_no++)
+				{
+					index_set_state_flags(level_index[level_no][run_no], INDEX_DROP_CLEAR_VALID);
+				}
 			}
 
 			SpinLockAcquire(&entry->spinlock);
@@ -1408,9 +1583,13 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 			{
 				entry->top[i] = top_index[i];
 			}
-			for (int i = 0; i < entry->num_levels; i++)
+			for (int level_no = 0; level_no < entry->num_levels; level_no++)
 			{
-				entry->level[i] = level_index[i];
+				entry->level_run_count[level_no] = 0;
+				for (int run_no = 0; run_no < entry->runs_per_level; run_no++)
+				{
+					entry->level[level_no][run_no] = level_index[level_no][run_no];
+				}
 			}
 			SpinLockRelease(&entry->spinlock);
 			{
@@ -1495,12 +1674,16 @@ _PG_init(void)
 					  0, 0, INT_MAX, AccessExclusiveLock);
 
 	/*
-	 * LSM3 MULTI-LEVEL CHANGE:
-	 * num_levels controls how many intermediate level indexes are created; ratio is reserved for level thresholds.
+	 * LSM3 MULTI-RUN LEVEL CHANGE:
+	 * num_levels controls the number of middle levels; runs_per_level controls how many immutable B-tree runs
+	 * each level may hold before tiered compaction; ratio controls size-based compaction thresholds.
 	 */
 	add_int_reloption(Lsm3ReloptKind, "num_levels",
 					  "Number of intermediate LSM levels",
 					  LSM3_DEFAULT_LEVELS, 1, LSM3_MAX_LEVELS, AccessExclusiveLock);
+	add_int_reloption(Lsm3ReloptKind, "runs_per_level",
+					  "Number of immutable B-tree runs per LSM level",
+					  LSM3_DEFAULT_RUNS_PER_LEVEL, 1, LSM3_MAX_RUNS_PER_LEVEL, AccessExclusiveLock);
 	add_int_reloption(Lsm3ReloptKind, "level_size_ratio",
 					  "Size multiplier between LSM levels",
 					  LSM3_DEFAULT_LEVEL_SIZE_RATIO, 2, INT_MAX, AccessExclusiveLock);
@@ -1550,7 +1733,7 @@ Datum
 lsm3_start_merge(PG_FUNCTION_ARGS)
 {
 	/*
-	 * LSM3 MULTI-LEVEL COMPACTION CHANGE:
+	 * LSM3 MULTI-RUN LEVEL CHANGE:
 	 * Manual merge now triggers the same top -> level0 -> cascade path as automatic overflow.
 	 */
 	Oid	relid = PG_GETARG_OID(0);
