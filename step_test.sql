@@ -104,6 +104,18 @@ FROM pg_class c
 WHERE c.relname LIKE 'lsm3_multirun_accum_idx%'
 ORDER BY c.relname;
 
+INSERT INTO lsm3_multirun_accum_test
+SELECT g, md5(g::text)
+FROM generate_series(400000,400005 ) AS g;
+
+SELECT
+    c.relname,
+    pg_size_pretty(pg_relation_size(c.oid)) AS size,
+    pg_relation_size(c.oid) AS bytes
+FROM pg_class c
+WHERE c.relname LIKE 'lsm3_multirun_accum_idx%'
+ORDER BY c.relname;
+
 \echo ''
 \echo 'TEST A pass/fail structural check'
 \echo 'Expected: all columns should be PASS.'
@@ -183,7 +195,7 @@ USING lsm3(id)
 WITH (
     num_levels = 3,
     runs_per_level = 2,
-    level_size_ratio = 100,
+    level_size_ratio = 10,
     top_index_size = 32
 );
 
@@ -191,6 +203,12 @@ WITH (
 INSERT INTO lsm3_multirun_compact_test
 SELECT g, md5(g::text)
 FROM generate_series(1, 8000) AS g;
+INSERT INTO lsm3_multirun_compact_test
+SELECT g, md5(g::text)
+FROM generate_series(800001, 1600000) AS g;
+INSERT INTO lsm3_multirun_compact_test
+SELECT g, md5(g::text)
+FROM generate_series(8100001, 16100000) AS g;
 
 SELECT lsm3_start_merge('lsm3_multirun_compact_idx'::regclass::oid);
 SELECT lsm3_wait_merge_completion('lsm3_multirun_compact_idx'::regclass::oid);
@@ -199,6 +217,10 @@ SELECT lsm3_wait_merge_completion('lsm3_multirun_compact_idx'::regclass::oid);
 INSERT INTO lsm3_multirun_compact_test
 SELECT g, md5(g::text)
 FROM generate_series(8001, 16000) AS g;
+
+INSERT INTO lsm3_multirun_compact_test
+SELECT g, md5(g::text)
+FROM generate_series(800001, 1600000) AS g;
 
 SELECT lsm3_start_merge('lsm3_multirun_compact_idx'::regclass::oid);
 SELECT lsm3_wait_merge_completion('lsm3_multirun_compact_idx'::regclass::oid);
